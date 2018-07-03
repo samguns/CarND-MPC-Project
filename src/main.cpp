@@ -77,7 +77,7 @@ int main() {
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     string sdata = string(data).substr(0, length);
-    cout << sdata << endl;
+    // cout << sdata << endl;
     if (sdata.size() > 2 && sdata[0] == '4' && sdata[1] == '2') {
       string s = hasData(sdata);
       if (s != "") {
@@ -91,15 +91,112 @@ int main() {
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
+          double steer_value = j[1]["steering_angle"];
+          double throttle_value = j[1]["throttle"];
+
+          for (size_t i = 0; i < ptsx.size(); i++) {
+            /**
+             * Shift car reference angle to 90 degrees
+             */
+            double shift_x = ptsx[i] - px;
+            double shift_y = ptsy[i] - py;
+
+            ptsx[i] = (shift_x * cos(0 - psi) - shift_y * sin(0 - psi));
+            ptsy[i] = (shift_x * sin(0 - psi) + shift_y * cos(0 - psi));
+          }
+
+          double *ptrx = &ptsx[0];
+          double *ptry = &ptsy[0];
+          Eigen::Map<Eigen::VectorXd> ptsx_transform(ptrx, 6);
+          Eigen::Map<Eigen::VectorXd> ptsy_transform(ptry, 6);
+
+          auto coeffs = polyfit(ptsx_transform, ptsy_transform, 3);
+          double cte = polyeval(coeffs, 0);
+          double epsi = -atan(coeffs[1]);
+
+          /**
+           * According to Section 7 of Lesson 19:
+           * One approach (to address actuator latency) would be
+           * running a simulation using the vehicle model starting
+           * from the current state for the duration of the latency.
+           * The resulting state from the simulation is the new
+           * initial state for MPC.
+           *
+           * So, given current px, py, psi, v, steer and throttle
+           * the vehicle feeds back to us, we apply the kinematic
+           * model to compute the new initial state for MPC after
+           * 100ms latency.
+           * The vehicle uses MPH metric, we have to convert it
+           * to Meters Per Second to comply Unity metric (1 meter/unit).
+           * 1 Mile per Hour = 0.44704 Meter per second
+           */
+          v *= 0.44704;
+          double Lf = 2.67;
+          double dt = 0.1;
+          px = 0;
+          py = 0;
+          psi = 0;
+          px += v * cos(psi) * dt;
+          py += v * sin(psi) * dt;
+          cte += v * sin(epsi) * dt;
+          epsi += v / Lf * steer_value * dt;
+          /**
+           * In the simulator, a positive psi value implies a right turn
+           * and a negative value implies a left turn. The workaround to address
+           * this problem is change the psi update equation to be:
+           * psi[t+1] = psi[t] - v[t] / Lf * delta[t] * dt
+           */
+          psi -= v / Lf * steer_value * dt;
+          v += throttle_value * dt;
+
+          Eigen::VectorXd state(6);
+          state << px, py, psi, v, cte, epsi;
+
+          /**
+           * Read in parameters for online tuning.
+           */
+//          std::ifstream params_file;
+//          params_file.open("params.csv");
+//          std::string step_s, int_s, ref_v_s, cte_s, epsi_s, steer_s, a_s, steer_diff_s, a_diff_s, reset;
+//          size_t step;
+//          double interval, ref_v, cte_f, epsi_f, steer_f, a_f, steer_diff_f, a_diff_f;
+//          while (params_file.good()) {
+//            std::getline(params_file, step_s, ',');
+//            std::getline(params_file, int_s, ',');
+//            std::getline(params_file, ref_v_s, ',');
+//            std::getline(params_file, cte_s, ',');
+//            std::getline(params_file, epsi_s, ',');
+//            std::getline(params_file, steer_s, ',');
+//            std::getline(params_file, a_s, ',');
+//            std::getline(params_file, steer_diff_s, ',');
+//            std::getline(params_file, a_diff_s, ',');
+//            std::getline(params_file, reset, ',');
+//          }
+//          step = std::stoul(step_s);
+//          interval = std::stod(int_s);
+//          ref_v = std::stod(ref_v_s);
+//          cte_f = std::stod(cte_s);
+//          epsi_f = std::stod(epsi_s);
+//          steer_f = std::stod(steer_s);
+//          a_f = std::stod(a_s);
+//          steer_diff_f = std::stod(steer_diff_s);
+//          a_diff_f = std::stod(a_diff_s);
+//          if ("1" == reset) {
+//            SetParams(step, interval, ref_v, cte_f, epsi_f, steer_f, a_f, steer_diff_f, a_diff_f);
+//            std::string msg = "42[\"reset\",{}]";
+//            ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+//          } else {
 
           /*
-          * TODO: Calculate steering angle and throttle using MPC.
+          * Calculate steering angle and throttle using MPC.
           *
           * Both are in between [-1, 1].
           *
           */
-          double steer_value;
-          double throttle_value;
+          auto vars = mpc.Solve(state, coeffs);
+
+          steer_value = vars[0] / (deg2rad(25));
+          throttle_value = vars[1];
 
           json msgJson;
           // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
@@ -107,12 +204,19 @@ int main() {
           msgJson["steering_angle"] = steer_value;
           msgJson["throttle"] = throttle_value;
 
-          //Display the MPC predicted trajectory 
+          //Display the MPC predicted trajectory
           vector<double> mpc_x_vals;
           vector<double> mpc_y_vals;
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Green line
+          for (size_t i = 2; i < vars.size(); i++) {
+            if (i % 2 == 0) {
+              mpc_x_vals.push_back(vars[i]);
+            } else {
+              mpc_y_vals.push_back(vars[i]);
+            }
+          }
 
           msgJson["mpc_x"] = mpc_x_vals;
           msgJson["mpc_y"] = mpc_y_vals;
@@ -123,13 +227,18 @@ int main() {
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
+          double poly_inc = 2.5;
+          int num_points = 25;
+          for (int n = 1; n < num_points; n++) {
+            next_x_vals.push_back(poly_inc * n);
+            next_y_vals.push_back(polyeval(coeffs, poly_inc * n));
+          }
 
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
-
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
-          std::cout << msg << std::endl;
+          // std::cout << msg << std::endl;
           // Latency
           // The purpose is to mimic real driving conditions where
           // the car does actuate the commands instantly.
